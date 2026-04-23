@@ -34,6 +34,10 @@ class DataStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._db: Optional[aiosqlite.Connection] = None
 
+    @property
+    def is_connected(self) -> bool:
+        return self._db is not None
+
     async def connect(self) -> None:
         """Connect to database and create tables."""
         logger.info(f"Connecting to database: {self.db_path}")

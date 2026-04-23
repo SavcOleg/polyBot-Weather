@@ -23,7 +23,7 @@ from polybot.connectors.polymarket import PolymarketConnector
 from polybot.connectors.noaa import NOAAConnector
 from polybot.connectors.pyth import PythConnector
 from polybot.connectors.copy_trading import CopyTradingConnector, discover_top_traders
-from polybot.core.risk_manager import RiskManager
+from polybot.core.risk_manager import RiskManager, RiskLimits
 from polybot.core.simulation import SimulationEngine
 from polybot.core.datastore import DataStore, create_datastore
 from polybot.strategies.weather_v2 import WeatherStrategyV2
@@ -70,6 +70,7 @@ class PolyBotRunner:
         # State
         self._running = False
         self._shutdown_event = asyncio.Event()
+        self._shutdown_complete = False
 
     async def initialize(self) -> None:
         """Initialize all components."""
@@ -102,17 +103,20 @@ class PolyBotRunner:
         
         # Initialize risk manager
         self.risk_manager = RiskManager(
-            max_position_percent=self.settings.risk.max_position_percent,
-            max_slippage_percent=self.settings.risk.max_slippage_percent,
-            max_daily_loss_percent=self.settings.risk.circuit_breaker_loss_percent,
-            max_open_positions=self.settings.risk.max_open_positions,
-            min_profit_threshold=self.settings.risk.min_arb_profit_percent,
+            total_capital=self.starting_capital,
+            limits=RiskLimits(
+                max_position_percent=Decimal(str(self.settings.risk.max_position_percent)),
+                max_slippage_percent=Decimal(str(self.settings.risk.max_slippage_percent)),
+                max_daily_loss_percent=Decimal(str(self.settings.risk.circuit_breaker_loss_percent)),
+                max_open_positions=self.settings.risk.max_open_positions,
+                min_profit_threshold=Decimal(str(self.settings.risk.min_arb_profit_percent)),
+            ),
         )
         
         # Initialize simulation engine if in simulation mode
         if self.simulation_mode:
             self.simulation = SimulationEngine(
-                starting_balance=self.starting_capital,
+                initial_balance=self.starting_capital,
                 fee_percent=Decimal("0"),  # Polymarket is 0% fees
                 slippage_percent=Decimal("0.5"),
             )
@@ -158,6 +162,9 @@ class PolyBotRunner:
 
     async def shutdown(self) -> None:
         """Graceful shutdown."""
+        if self._shutdown_complete:
+            return
+        self._shutdown_complete = True
         logger.info("🛑 Shutting down PolyBot...")
         self._running = False
         self._shutdown_event.set()
@@ -178,11 +185,10 @@ class PolyBotRunner:
             logger.info("=" * 60)
             logger.info("📊 FINAL SIMULATION RESULTS")
             logger.info("=" * 60)
-            logger.info(f"Starting Balance: ${summary['starting_balance']:.2f}")
+            logger.info(f"Starting Balance: ${summary['initial_balance']:.2f}")
             logger.info(f"Final Balance: ${summary['current_balance']:.2f}")
             logger.info(f"Total P&L: ${summary['total_pnl']:.2f} ({summary['return_percent']:.1f}%)")
-            logger.info(f"Trades Executed: {summary['trades_executed']}")
-            logger.info(f"Win Rate: {summary['win_rate']:.1%}")
+            logger.info(f"Trades Executed: {summary['total_trades']}")
             logger.info("=" * 60)
         
         logger.info("👋 PolyBot shutdown complete")
@@ -199,9 +205,9 @@ class PolyBotRunner:
                 if signal.confidence in ("HIGH", "MEDIUM"):
                     # Check risk limits
                     allowed, reason, size = self.risk_manager.validate_trade(
-                        requested_size=self.starting_capital * Decimal(str(signal.kelly_fraction)),
-                        expected_profit_percent=float(signal.edge) * 100,
-                        market_liquidity=signal.market.liquidity,
+                        size=self.starting_capital * Decimal(str(signal.kelly_fraction)),
+                        expected_profit_percent=Decimal(str(float(signal.edge) * 100)),
+                        liquidity=signal.market.liquidity,
                     )
                     
                     if allowed:
@@ -248,9 +254,9 @@ class PolyBotRunner:
             for signal in signals[:3]:  # Execute top 3 signals
                 if signal.confidence in ("HIGH", "MEDIUM"):
                     allowed, reason, size = self.risk_manager.validate_trade(
-                        requested_size=self.starting_capital * Decimal(str(signal.kelly_fraction)),
-                        expected_profit_percent=float(signal.edge) * 100,
-                        market_liquidity=signal.market.liquidity,
+                        size=self.starting_capital * Decimal(str(signal.kelly_fraction)),
+                        expected_profit_percent=Decimal(str(float(signal.edge) * 100)),
+                        liquidity=signal.market.liquidity,
                     )
                     
                     if allowed:
@@ -344,7 +350,8 @@ class PolyBotRunner:
                     last_snapshot = loop_start
                 
                 # Update daily performance
-                await self.datastore.update_daily_performance()
+                if self.datastore and self.datastore.is_connected:
+                    await self.datastore.update_daily_performance()
                 
                 # Show current status
                 if self.simulation:
@@ -352,7 +359,7 @@ class PolyBotRunner:
                     logger.info(
                         f"💰 Balance: ${summary['current_balance']:.2f} | "
                         f"P&L: ${summary['total_pnl']:.2f} ({summary['return_percent']:.1f}%) | "
-                        f"Trades: {summary['trades_executed']}"
+                        f"Trades: {summary['total_trades']}"
                     )
                 
                 # Wait for next scan
@@ -399,9 +406,11 @@ class PolyBotRunner:
             await self.shutdown()
 
     async def _auto_shutdown(self, minutes: int) -> None:
-        """Auto-shutdown after specified duration."""
+        """Stop the main loop after N minutes; `run()`'s finally block runs full shutdown."""
         await asyncio.sleep(minutes * 60)
-        await self.shutdown()
+        logger.info("⏱️ Duration limit reached — stopping main loop")
+        self._running = False
+        self._shutdown_event.set()
 
 
 async def main():

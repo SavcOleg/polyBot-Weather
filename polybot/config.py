@@ -11,7 +11,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class PolymarketConfig(BaseSettings):
     """Polymarket-specific configuration."""
 
-    model_config = SettingsConfigDict(env_prefix="POLYMARKET_")
+    model_config = SettingsConfigDict(
+        env_prefix="POLYMARKET_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     private_key: SecretStr = Field(..., description="Polygon wallet private key")
     funder_address: str = Field(..., description="Polygon wallet address")
